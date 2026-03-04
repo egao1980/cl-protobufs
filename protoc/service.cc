@@ -7,6 +7,7 @@
 #include "service.h"
 
 #include <cstdint>
+
 #include "absl/log/absl_log.h"
 #include <google/protobuf/descriptor.pb.h>
 #include <google/protobuf/message.h>

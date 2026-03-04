@@ -7,12 +7,12 @@
 #ifndef GOOGLE_CL_PROTOBUF_COMPILER_LISP_MESSAGE_H__
 #define GOOGLE_CL_PROTOBUF_COMPILER_LISP_MESSAGE_H__
 
+#include <cstdint>
 #include <memory>
 #include <set>
 #include <string>
 #include <vector>
 
-#include <cstdint>
 #include <google/protobuf/descriptor.h>
 #include "enum.h"
 #include <google/protobuf/io/printer.h>
@@ -43,7 +43,7 @@ class MessageGenerator {
   std::vector<std::unique_ptr<EnumGenerator>> enums_;
 
   void GenerateSource(io::Printer* printer, const std::string& lisp_name,
-                      const int32 number, const FieldDescriptor::Label label);
+                      const int32_t number, const FieldDescriptor::Label label);
 
   MessageGenerator(const MessageGenerator&) = delete;
   MessageGenerator& operator=(const MessageGenerator&) = delete;

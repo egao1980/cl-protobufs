@@ -8,7 +8,6 @@
 
 #include <map>
 
-#include <cstdint>
 #include "absl/log/absl_log.h"
 #include <google/protobuf/descriptor.pb.h>
 #include <google/protobuf/descriptor.h>

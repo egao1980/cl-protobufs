@@ -51,7 +51,6 @@ cc_library(
         "//net/proto2/compiler/public:code_generator",
         "//net/proto2/proto:descriptor_cc_proto",
         "//net/proto2/public:proto2",
-        "//strings",
         "//third_party/absl/strings",
         "//third_party/lisp/cl_protobufs:proto2_descriptor_extensions_cc_proto",
         "//third_party/protobuf/io",
