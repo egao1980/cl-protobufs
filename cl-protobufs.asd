@@ -27,6 +27,35 @@ and functionality for working with them."
                :cl-base64
                :local-time
                :float-features)
+  :properties (:cl-repo (:provides ("cl-protobufs" "cl-protobufs.asdf")
+                          :overlays ((:platform (:os "darwin" :arch "arm64")
+                                      :layers ((:role "native-library"
+                                                :files (("lib/darwin-arm64/protoc" . "protoc")
+                                                        ("lib/darwin-arm64/protoc-gen-cl-pb"
+                                                         . "protoc-gen-cl-pb")))
+                                               (:role "generated-source"
+                                                :files (("generated/darwin-arm64/descriptor.lisp"
+                                                         . "descriptor.lisp")
+                                                        ("generated/darwin-arm64/any.lisp"
+                                                         . "any.lisp")
+                                                        ("generated/darwin-arm64/source_context.lisp"
+                                                         . "source_context.lisp")
+                                                        ("generated/darwin-arm64/type.lisp"
+                                                         . "type.lisp")
+                                                        ("generated/darwin-arm64/api.lisp"
+                                                         . "api.lisp")
+                                                        ("generated/darwin-arm64/duration.lisp"
+                                                         . "duration.lisp")
+                                                        ("generated/darwin-arm64/empty.lisp"
+                                                         . "empty.lisp")
+                                                        ("generated/darwin-arm64/field_mask.lisp"
+                                                         . "field_mask.lisp")
+                                                        ("generated/darwin-arm64/timestamp.lisp"
+                                                         . "timestamp.lisp")
+                                                        ("generated/darwin-arm64/wrappers.lisp"
+                                                         . "wrappers.lisp")
+                                                        ("generated/darwin-arm64/struct.lisp"
+                                                         . "struct.lisp"))))))))
   :serial t
   :in-order-to ((test-op (test-op :cl-protobufs/tests)))
   :components

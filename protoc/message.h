@@ -43,7 +43,7 @@ class MessageGenerator {
   std::vector<std::unique_ptr<EnumGenerator>> enums_;
 
   void GenerateSource(io::Printer* printer, const std::string& lisp_name,
-                      const int32_t number, const FieldDescriptor::Label label);
+                      const int32_t number);
 
   MessageGenerator(const MessageGenerator&) = delete;
   MessageGenerator& operator=(const MessageGenerator&) = delete;
