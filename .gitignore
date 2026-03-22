@@ -4,6 +4,10 @@ protoc/*.h
 protoc/protoc-gen-lisp
 protoc/protoc-gen-cl-pb
 protoc/protoc_middleman
+protoc/build/
+protoc/CMakeCache.txt
+protoc/CMakeFiles/
+protoc/cmake_install.cmake
 
 # Pre-generated well-known-types .lisp files (build artifacts from proto-to-lisp)
 /descriptor.lisp
