@@ -1,0 +1,11 @@
+{
+  "name": "cl-protobufs OCI test",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "features": {
+    "ghcr.io/egao1980/features/roswell:1": {
+      "version": "latest"
+    }
+  },
+  "postCreateCommand": "ros install qlot && oras version",
+  "runArgs": ["--add-host=host.docker.internal:host-gateway"]
+}

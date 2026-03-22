@@ -1,24 +1,35 @@
 # Build cl-protobufs OCI package with native overlays (protoc toolchain + pre-generated .lisp).
-#
-# darwin/arm64 only for now. Linux overlays will be added once this flow is proven.
 name: Publish OCI Package
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version (default: from tag)"
+        required: false
+        default: ""
+      registry:
+        description: "OCI registry (default: ghcr.io)"
+        required: false
+        default: ""
 
 env:
-  REGISTRY: ghcr.io
-  NAMESPACE: ${{ github.repository_owner }}/cl-systems
+  DEFAULT_REGISTRY: ghcr.io
 
 jobs:
-  # ── Build native artifacts on darwin/arm64 ─────────────────────────
   build:
     strategy:
       fail-fast: true
       matrix:
         include:
+          - os: linux
+            arch: amd64
+            runner: ubuntu-latest
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm64
           - os: darwin
             arch: arm64
             runner: macos-latest
@@ -27,40 +38,61 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Homebrew (Linux)
+        if: matrix.os == 'linux'
+        uses: Homebrew/actions/setup-homebrew@master
+
+      - name: Add Homebrew to environment (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
+          echo "/home/linuxbrew/.linuxbrew/sbin" >> "$GITHUB_PATH"
+          BREW_PREFIX="/home/linuxbrew/.linuxbrew"
+          {
+            echo "HOMEBREW_PREFIX=${BREW_PREFIX}"
+            echo "HOMEBREW_CELLAR=${BREW_PREFIX}/Cellar"
+            echo "HOMEBREW_REPOSITORY=${BREW_PREFIX}/Homebrew"
+            echo "PKG_CONFIG_PATH=${BREW_PREFIX}/lib/pkgconfig:${BREW_PREFIX}/share/pkgconfig"
+            echo "CPATH=${BREW_PREFIX}/include"
+            echo "LIBRARY_PATH=${BREW_PREFIX}/lib"
+            echo "LD_LIBRARY_PATH=${BREW_PREFIX}/lib"
+          } >> "$GITHUB_ENV"
+
+      - name: Install build deps (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y build-essential
+          brew install protobuf cmake pkg-config
+
       - name: Install build deps (macOS)
         if: matrix.os == 'darwin'
-        run: |
-          brew install grpc cmake pkg-config
-          echo "protobuf=$(brew info protobuf --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["formulae"][0]["versions"]["stable"])')" >> "$GITHUB_OUTPUT"
-        id: deps
+        run: brew install protobuf cmake pkg-config
 
       - name: Build protoc-gen-cl-pb
         run: |
-          cd protoc
-          cmake . -DCMAKE_CXX_STANDARD=17
-          cmake --build . --parallel "$(sysctl -n hw.ncpu)"
+          rm -rf protoc/build
+          cmake -S protoc -B protoc/build -DCMAKE_CXX_STANDARD=17
+          NPROC=$( (nproc || sysctl -n hw.ncpu) 2>/dev/null )
+          cmake --build protoc/build --parallel "${NPROC}"
 
       - name: Pre-generate well-known-types .lisp files
         run: |
           mkdir -p generated
-          PROTOS="descriptor any source_context type api duration empty field_mask timestamp wrappers struct"
-          # Use --proto_path=google/protobuf/ with bare filenames to match
-          # ASDF's proto-to-lisp invocation (bare add-file-descriptor names)
-          for proto in $PROTOS; do
+          for proto in descriptor any source_context type api duration empty field_mask timestamp wrappers struct; do
             protoc --proto_path=google/protobuf/ \
-              --plugin=protoc-gen-cl-pb=protoc/protoc-gen-cl-pb \
+              --plugin=protoc-gen-cl-pb=protoc/build/protoc-gen-cl-pb \
               --cl-pb_out="output-file=${proto}.lisp:generated/" \
               "${proto}.proto" \
               --experimental_allow_proto3_optional
           done
-          echo "Generated files:"
           ls -la generated/
 
       - name: Collect artifacts
         run: |
           mkdir -p artifacts/lib artifacts/generated
           cp "$(brew --prefix)/bin/protoc" artifacts/lib/protoc
-          cp protoc/protoc-gen-cl-pb artifacts/lib/protoc-gen-cl-pb
+          cp protoc/build/protoc-gen-cl-pb artifacts/lib/protoc-gen-cl-pb
           cp generated/*.lisp artifacts/generated/
           chmod +x artifacts/lib/protoc artifacts/lib/protoc-gen-cl-pb
 
@@ -70,7 +102,6 @@ jobs:
           name: native-${{ matrix.os }}-${{ matrix.arch }}
           path: artifacts/
 
-  # ── Collect artifacts and publish OCI package ──────────────────────
   publish:
     needs: build
     runs-on: ubuntu-latest
@@ -89,6 +120,7 @@ jobs:
       - name: Arrange overlay directories
         run: |
           for dir in native-artifacts/native-*; do
+            [ -d "$dir" ] || continue
             slug=$(basename "$dir" | sed 's/^native-//')
             os=$(echo "$slug" | cut -d- -f1)
             arch=$(echo "$slug" | cut -d- -f2)
@@ -96,10 +128,10 @@ jobs:
             cp "$dir"/lib/* "lib/${os}-${arch}/"
             cp "$dir"/generated/* "generated/${os}-${arch}/"
             chmod +x "lib/${os}-${arch}/"*
+            echo "${os}/${arch}" >> /tmp/platforms.txt
           done
-          echo "==> lib/"
+          echo "Platforms:"; cat /tmp/platforms.txt
           find lib/ -type f
-          echo "==> generated/"
           find generated/ -type f
 
       - name: Install SBCL
@@ -115,8 +147,12 @@ jobs:
             --load ~/quicklisp/setup.lisp \
             --eval '(ql-util:without-prompting (ql:add-to-init-file))'
 
+      # setup-oras@v1 bundles a fixed release manifest: 1.3.1+ is not listed yet; default 1.3.0 linux_arm64
+      # sometimes 404 in act. 1.2.3 is in the manifest with linux_arm64 checksums.
       - name: Install oras
         uses: oras-project/setup-oras@v1
+        with:
+          version: 1.2.3
 
       - name: Pull cl-repository-packager from GHCR
         run: |
@@ -129,34 +165,78 @@ jobs:
           for f in /tmp/cl-repo-pull/*.tar.gz; do
             tar -xzf "$f" -C ~/.local/share/cl-systems/
           done
-          echo "Extracted cl-repository-packager:"
-          ls -la ~/.local/share/cl-systems/
 
       - name: Build and publish OCI package
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          NAMESPACE=$(echo "${{ env.NAMESPACE }}" | tr '[:upper:]' '[:lower:]')
+          REGISTRY="${{ inputs.registry || env.DEFAULT_REGISTRY }}"
+          VERSION="${{ inputs.version }}"
+          [ -z "$VERSION" ] && VERSION="${GITHUB_REF_NAME#v}"
+          NAMESPACE="${{ github.repository_owner }}/cl-systems"
+          NAMESPACE=$(echo "$NAMESPACE" | tr '[:upper:]' '[:lower:]')
+
+          if [ "$REGISTRY" = "ghcr.io" ]; then
+            REGISTRY_URL="https://${REGISTRY}"
+          else
+            REGISTRY_URL="http://${REGISTRY}"
+          fi
 
           cat > /tmp/publish.lisp <<'LISP'
           (require :asdf)
-
           (asdf:initialize-source-registry
             '(:source-registry
               (:tree (:home ".local/share/cl-systems/"))
               :inherit-configuration))
-
           (load (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))
           (ql:quickload :cl-repository-packager)
 
           (let* ((version (uiop:getenv "PKG_VERSION"))
-                 (auth (cl-oci-client/auth:make-auth-config
-                         :username (uiop:getenv "GITHUB_ACTOR")
-                         :password (uiop:getenv "GITHUB_TOKEN")))
-                 (reg (cl-oci-client/registry:make-registry
-                        (format nil "https://~a" (uiop:getenv "OCI_REGISTRY"))
-                        :auth auth))
+                 (registry-url (uiop:getenv "REGISTRY_URL"))
+                 (namespace (uiop:getenv "OCI_NAMESPACE"))
+                 (use-auth (string= "ghcr.io" (uiop:getenv "OCI_REGISTRY")))
+                 (auth (when use-auth
+                         (cl-oci-client/auth:make-auth-config
+                           :username (uiop:getenv "GITHUB_ACTOR")
+                           :password (uiop:getenv "GITHUB_TOKEN"))))
+                 (reg (if use-auth
+                         (cl-oci-client/registry:make-registry registry-url :auth auth)
+                         (cl-oci-client/registry:make-registry registry-url)))
+                 (platform-lines (uiop:read-file-lines "/tmp/platforms.txt"))
+                 (generated-files '(("descriptor.lisp" . "descriptor.lisp")
+                                    ("any.lisp" . "any.lisp")
+                                    ("source_context.lisp" . "source_context.lisp")
+                                    ("type.lisp" . "type.lisp")
+                                    ("api.lisp" . "api.lisp")
+                                    ("duration.lisp" . "duration.lisp")
+                                    ("empty.lisp" . "empty.lisp")
+                                    ("field_mask.lisp" . "field_mask.lisp")
+                                    ("timestamp.lisp" . "timestamp.lisp")
+                                    ("wrappers.lisp" . "wrappers.lisp")
+                                    ("struct.lisp" . "struct.lisp")))
+                 (overlays
+                   (loop for line in platform-lines
+                         for slash = (position #\/ line)
+                         when slash
+                         collect
+                         (let* ((os (subseq line 0 slash))
+                                (arch (subseq line (1+ slash)))
+                                (prefix (format nil "~a-~a" os arch)))
+                           (make-instance 'cl-repository-packager/build-matrix:overlay-spec
+                             :os os :arch arch
+                             :layers
+                             (list
+                               (list :role "native-library"
+                                     :files (list
+                                             (cons (format nil "lib/~a/protoc" prefix) "protoc")
+                                             (cons (format nil "lib/~a/protoc-gen-cl-pb" prefix)
+                                                   "protoc-gen-cl-pb")))
+                               (list :role "generated-source"
+                                     :files (mapcar
+                                              (lambda (pair)
+                                                (cons (format nil "generated/~a/~a" prefix (car pair))
+                                                      (cdr pair)))
+                                              generated-files)))))))
                  (spec (make-instance 'cl-repository-packager/build-matrix:package-spec
                          :name "cl-protobufs"
                          :version version
@@ -166,45 +246,18 @@ jobs:
                          :depends-on '("closer-mop" "alexandria" "trivial-garbage"
                                        "cl-base64" "local-time" "float-features")
                          :provides '("cl-protobufs" "cl-protobufs.asdf")
-                         :overlays (list
-                           (make-instance 'cl-repository-packager/build-matrix:overlay-spec
-                             :os "darwin" :arch "arm64"
-                             :layers (list
-                                      (list :role "native-library"
-                                            :files '(("lib/darwin-arm64/protoc" . "protoc")
-                                                     ("lib/darwin-arm64/protoc-gen-cl-pb"
-                                                      . "protoc-gen-cl-pb")))
-                                      (list :role "generated-source"
-                                            :files '(("generated/darwin-arm64/descriptor.lisp"
-                                                      . "descriptor.lisp")
-                                                     ("generated/darwin-arm64/any.lisp"
-                                                      . "any.lisp")
-                                                     ("generated/darwin-arm64/source_context.lisp"
-                                                      . "source_context.lisp")
-                                                     ("generated/darwin-arm64/type.lisp"
-                                                      . "type.lisp")
-                                                     ("generated/darwin-arm64/api.lisp"
-                                                      . "api.lisp")
-                                                     ("generated/darwin-arm64/duration.lisp"
-                                                      . "duration.lisp")
-                                                     ("generated/darwin-arm64/empty.lisp"
-                                                      . "empty.lisp")
-                                                     ("generated/darwin-arm64/field_mask.lisp"
-                                                      . "field_mask.lisp")
-                                                     ("generated/darwin-arm64/timestamp.lisp"
-                                                      . "timestamp.lisp")
-                                                     ("generated/darwin-arm64/wrappers.lisp"
-                                                      . "wrappers.lisp")
-                                                     ("generated/darwin-arm64/struct.lisp"
-                                                      . "struct.lisp"))))))))
+                         :overlays overlays))
                  (result (cl-repository-packager/build-matrix:build-package spec)))
+            (format t "~%Overlays: ~{~a~^, ~}~%" platform-lines)
             (cl-repository-packager/publisher:publish-package
-              reg (uiop:getenv "OCI_NAMESPACE") version result spec))
+              reg namespace version result spec)
+            (format t "Published cl-protobufs:~a to ~a/~a~%" version registry-url namespace))
           LISP
 
           PKG_VERSION="$VERSION" \
+          OCI_REGISTRY="$REGISTRY" \
+          REGISTRY_URL="$REGISTRY_URL" \
           GITHUB_ACTOR="${{ github.actor }}" \
-          OCI_REGISTRY="${{ env.REGISTRY }}" \
           OCI_NAMESPACE="$NAMESPACE" \
           sbcl --noinform --non-interactive --load /tmp/publish.lisp
 
@@ -212,7 +265,14 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          NAMESPACE=$(echo "${{ env.NAMESPACE }}" | tr '[:upper:]' '[:lower:]')
-          oras manifest fetch "${REGISTRY}/${NAMESPACE}/cl-protobufs:${VERSION}" \
-            --registry-config <(echo "{\"auths\":{\"ghcr.io\":{\"username\":\"${{ github.actor }}\",\"password\":\"${GITHUB_TOKEN}\"}}}")
+          REGISTRY="${{ inputs.registry || env.DEFAULT_REGISTRY }}"
+          VERSION="${{ inputs.version }}"
+          [ -z "$VERSION" ] && VERSION="${GITHUB_REF_NAME#v}"
+          NAMESPACE="${{ github.repository_owner }}/cl-systems"
+          NAMESPACE=$(echo "$NAMESPACE" | tr '[:upper:]' '[:lower:]')
+          if [ "$REGISTRY" = "ghcr.io" ]; then
+            oras manifest fetch "${REGISTRY}/${NAMESPACE}/cl-protobufs:${VERSION}" \
+              --registry-config <(echo "{\"auths\":{\"ghcr.io\":{\"username\":\"${{ github.actor }}\",\"password\":\"${GITHUB_TOKEN}\"}}}")
+          else
+            oras manifest fetch "${REGISTRY}/${NAMESPACE}/cl-protobufs:${VERSION}" --insecure --plain-http
+          fi

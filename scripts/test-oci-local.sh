@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Test the full OCI publish pipeline locally for cl-protobufs.
-# Builds protoc-gen-cl-pb, pre-generates well-known-types .lisp files,
+# Builds both darwin/arm64 (natively) and linux/amd64 (via Docker) overlays,
 # publishes to a local OCI registry, and verifies the resulting image index.
 #
 # Prerequisites: docker, sbcl, oras, brew (protobuf, cmake, pkg-config)
@@ -14,6 +14,7 @@ VERSION="${1:-2.0}"
 CONTAINER_NAME="cl-oci-test-registry"
 CL_SYSTEMS_DIR="${HOME}/.local/share/cl-systems"
 TMPDIR_PULL="$(mktemp -d)"
+BUILD_IMAGE="cl-protobufs-builder:latest"
 
 cleanup() {
   echo "==> Cleanup"
@@ -32,7 +33,24 @@ for cmd in docker sbcl oras cmake protoc; do
   fi
 done
 
-# ── Build protoc-gen-cl-pb ───────────────────────────────────────────
+# ── Helper: pre-generate well-known-types .lisp files ────────────────
+generate_wkt() {
+  local out_dir="$1" plugin_path="$2"
+  mkdir -p "$out_dir"
+  # Use --proto_path=google/protobuf/ with bare filenames to match
+  # how ASDF's proto-to-lisp invokes protoc (bare add-file-descriptor names)
+  for proto in descriptor any source_context type api duration empty field_mask timestamp wrappers struct; do
+    protoc --proto_path=google/protobuf/ \
+      --plugin=protoc-gen-cl-pb="$plugin_path" \
+      "--cl-pb_out=output-file=${proto}.lisp:${out_dir}/" \
+      "${proto}.proto" \
+      --experimental_allow_proto3_optional
+  done
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# darwin/arm64 — native build
+# ══════════════════════════════════════════════════════════════════════
 echo "==> Building protoc-gen-cl-pb (darwin/arm64)"
 cd "${PROJECT_DIR}/protoc"
 cmake . -DCMAKE_CXX_STANDARD=17 > /tmp/cl-pb-cmake.log 2>&1
@@ -40,34 +58,59 @@ cmake --build . --parallel "$(sysctl -n hw.ncpu)" >> /tmp/cl-pb-cmake.log 2>&1
 echo "    Built: $(file protoc-gen-cl-pb | cut -d: -f2)"
 cd "${PROJECT_DIR}"
 
-# ── Pre-generate well-known-types .lisp files ────────────────────────
-echo "==> Pre-generating well-known-types .lisp files"
-mkdir -p generated/darwin-arm64
-
-# Use --proto_path=google/protobuf/ with bare filenames to match
-# how ASDF's proto-to-lisp invokes protoc (ensures add-file-descriptor
-# registers bare names that match import lookups)
-for proto in descriptor any source_context type api duration empty field_mask timestamp wrappers struct; do
-  protoc --proto_path=google/protobuf/ \
-    --plugin=protoc-gen-cl-pb=protoc/protoc-gen-cl-pb \
-    "--cl-pb_out=output-file=${proto}.lisp:generated/darwin-arm64/" \
-    "${proto}.proto" \
-    --experimental_allow_proto3_optional
-done
-
+echo "==> Pre-generating well-known-types .lisp (darwin/arm64)"
+generate_wkt generated/darwin-arm64 protoc/protoc-gen-cl-pb
 echo "    Generated $(ls generated/darwin-arm64/*.lisp | wc -l | tr -d ' ') .lisp files"
 
-# ── Collect native overlay artifacts ─────────────────────────────────
-echo "==> Collecting native overlay artifacts"
+echo "==> Collecting native overlay artifacts (darwin/arm64)"
 rm -rf lib/darwin-arm64
 mkdir -p lib/darwin-arm64
 install -m 755 "$(realpath "$(brew --prefix)/bin/protoc")" lib/darwin-arm64/protoc
 install -m 755 protoc/protoc-gen-cl-pb lib/darwin-arm64/protoc-gen-cl-pb
 
-echo "    lib/darwin-arm64:"
-ls -la lib/darwin-arm64/
-echo "    generated/darwin-arm64:"
-ls generated/darwin-arm64/
+# ══════════════════════════════════════════════════════════════════════
+# linux/amd64 — Docker build
+# ══════════════════════════════════════════════════════════════════════
+echo "==> Ensuring Docker build image (${BUILD_IMAGE})"
+if ! docker image inspect "$BUILD_IMAGE" &>/dev/null; then
+  echo "    Building image from Dockerfile.protobuf-builder (this takes a while the first time)..."
+  docker build --platform linux/amd64 -t "$BUILD_IMAGE" \
+    -f "${PROJECT_DIR}/Dockerfile.protobuf-builder" "${PROJECT_DIR}" \
+    > /tmp/cl-pb-docker-build.log 2>&1 \
+    || { tail -50 /tmp/cl-pb-docker-build.log; exit 1; }
+fi
+
+echo "==> Building protoc-gen-cl-pb + generating .lisp (linux/amd64) via Docker"
+docker run --rm --platform linux/amd64 \
+  -v "${PROJECT_DIR}:/src" \
+  -w /src \
+  "$BUILD_IMAGE" \
+  bash -c '
+    set -euo pipefail
+    # Out-of-source build; stale .pb.h from host must not shadow generated ones
+    rm -f protoc/proto2-descriptor-extensions.pb.{h,cc}
+    cmake -S protoc -B /tmp/protoc-build -DCMAKE_CXX_STANDARD=17 > /dev/null 2>&1
+    cmake --build /tmp/protoc-build --parallel "$(nproc)" 2>&1 | tail -3
+    echo "Built: $(file /tmp/protoc-build/protoc-gen-cl-pb | cut -d: -f2)"
+
+    mkdir -p generated/linux-amd64
+    for proto in descriptor any source_context type api duration empty field_mask timestamp wrappers struct; do
+      protoc --proto_path=google/protobuf/ \
+        --plugin=protoc-gen-cl-pb=/tmp/protoc-build/protoc-gen-cl-pb \
+        "--cl-pb_out=output-file=${proto}.lisp:generated/linux-amd64/" \
+        "${proto}.proto" \
+        --experimental_allow_proto3_optional
+    done
+    echo "Generated $(ls generated/linux-amd64/*.lisp | wc -l) .lisp files"
+
+    mkdir -p lib/linux-amd64
+    install -m 755 "$(realpath "$(brew --prefix)/bin/protoc")" lib/linux-amd64/protoc
+    install -m 755 /tmp/protoc-build/protoc-gen-cl-pb lib/linux-amd64/protoc-gen-cl-pb
+  '
+
+echo "==> Built artifacts:"
+find "${PROJECT_DIR}/lib" -type f
+find "${PROJECT_DIR}/generated" -name '*.lisp' | wc -l | xargs -I{} echo "    {} generated .lisp files total"
 
 # ── Start local OCI registry ─────────────────────────────────────────
 echo "==> Starting local OCI registry on ${REGISTRY}"
@@ -111,6 +154,17 @@ cat > "${TMPDIR_PULL}/publish.lisp" <<'LISP'
        (namespace (uiop:getenv "OCI_NAMESPACE"))
        (source-dir (uiop:getenv "SOURCE_DIR"))
        (reg (cl-oci-client/registry:make-registry registry-url))
+       (generated-files '(("descriptor.lisp" . "descriptor.lisp")
+                          ("any.lisp" . "any.lisp")
+                          ("source_context.lisp" . "source_context.lisp")
+                          ("type.lisp" . "type.lisp")
+                          ("api.lisp" . "api.lisp")
+                          ("duration.lisp" . "duration.lisp")
+                          ("empty.lisp" . "empty.lisp")
+                          ("field_mask.lisp" . "field_mask.lisp")
+                          ("timestamp.lisp" . "timestamp.lisp")
+                          ("wrappers.lisp" . "wrappers.lisp")
+                          ("struct.lisp" . "struct.lisp")))
        (spec (make-instance 'cl-repository-packager/build-matrix:package-spec
                :name "cl-protobufs"
                :version version
@@ -120,37 +174,25 @@ cat > "${TMPDIR_PULL}/publish.lisp" <<'LISP'
                :depends-on '("closer-mop" "alexandria" "trivial-garbage"
                              "cl-base64" "local-time" "float-features")
                :provides '("cl-protobufs" "cl-protobufs.asdf")
-               :overlays (list
-                 (make-instance 'cl-repository-packager/build-matrix:overlay-spec
-                   :os "darwin" :arch "arm64"
-                   :layers (list
-                     (list :role "native-library"
-                           :files '(("lib/darwin-arm64/protoc" . "protoc")
-                                    ("lib/darwin-arm64/protoc-gen-cl-pb"
-                                     . "protoc-gen-cl-pb")))
-                     (list :role "generated-source"
-                           :files '(("generated/darwin-arm64/descriptor.lisp"
-                                     . "descriptor.lisp")
-                                    ("generated/darwin-arm64/any.lisp"
-                                     . "any.lisp")
-                                    ("generated/darwin-arm64/source_context.lisp"
-                                     . "source_context.lisp")
-                                    ("generated/darwin-arm64/type.lisp"
-                                     . "type.lisp")
-                                    ("generated/darwin-arm64/api.lisp"
-                                     . "api.lisp")
-                                    ("generated/darwin-arm64/duration.lisp"
-                                     . "duration.lisp")
-                                    ("generated/darwin-arm64/empty.lisp"
-                                     . "empty.lisp")
-                                    ("generated/darwin-arm64/field_mask.lisp"
-                                     . "field_mask.lisp")
-                                    ("generated/darwin-arm64/timestamp.lisp"
-                                     . "timestamp.lisp")
-                                    ("generated/darwin-arm64/wrappers.lisp"
-                                     . "wrappers.lisp")
-                                    ("generated/darwin-arm64/struct.lisp"
-                                     . "struct.lisp"))))))))
+               :overlays
+               (flet ((make-overlay (os arch)
+                        (let ((prefix (format nil "~a-~a" os arch)))
+                          (make-instance 'cl-repository-packager/build-matrix:overlay-spec
+                            :os os :arch arch
+                            :layers
+                            (list
+                             (list :role "native-library"
+                                   :files (list
+                                           (cons (format nil "lib/~a/protoc" prefix) "protoc")
+                                           (cons (format nil "lib/~a/protoc-gen-cl-pb" prefix)
+                                                 "protoc-gen-cl-pb")))
+                             (list :role "generated-source"
+                                   :files (mapcar (lambda (pair)
+                                                    (cons (format nil "generated/~a/~a" prefix (car pair))
+                                                          (cdr pair)))
+                                                  generated-files)))))))
+                 (list (make-overlay "darwin" "arm64")
+                       (make-overlay "linux" "amd64")))))
        (result (cl-repository-packager/build-matrix:build-package spec)))
   (cl-repository-packager/publisher:publish-package
     reg namespace version result spec)
