@@ -130,40 +130,69 @@ search path will be the directory of the parent component."
   ()
   (:documentation "Condition signalled when translating a .proto file into Lisp code fails."))
 
+(defun find-protobuf-tool (name)
+  "Find NAME (e.g. \"protoc\") in the cl-protobufs native/ dir installed by cl-repository.
+Falls back to NIL if not found, letting callers use PATH lookup instead."
+  (let* ((sys (asdf:find-system :cl-protobufs.asdf nil))
+         (src-dir (when sys (asdf:system-source-directory sys)))
+         (native (when src-dir (merge-pathnames "native/" src-dir)))
+         (path (when native (merge-pathnames name native))))
+    (when (and path (probe-file path))
+      ;; OCI tarballs may strip execute bits; ensure the binary is executable
+      (let ((ns (namestring path)))
+        (ignore-errors
+          (uiop:run-program (list "chmod" "+x" ns)
+                            :ignore-error-status t))
+        ns))))
+
 (defmethod perform :before ((operation proto-to-lisp) (component protobuf-source-file))
   (map nil #'ensure-directories-exist (output-files operation component)))
 
 (defmethod perform ((operation proto-to-lisp) (component protobuf-source-file))
   (let* ((source-file (first (input-files operation component)))
-         (source-file-argument (if (proto-pathname component)
-                                   ;; If a PROTO-PATHNAME is specified in the component, use
-                                   ;; only the filename and type as the argument to protoc.
-                                   (file-namestring source-file)
-                                   ;; If a PROTO-PATHNAME is not specified in the component,
-                                   ;; use the entire PROTOBUF-SOURCE-FILE + .proto as the
-                                   ;; argument to protoc.
-                                   (namestring source-file)))
-         ;; Around methods on output-file may globally redirect output products, so we must call
-         ;; that method instead of executing (component-pathname component).
-         (output-file (first (output-files operation component)))
-         (search-path (get-search-paths component))
-         (command (format nil "protoc --proto_path=~{~A~^:~} --cl-pb_out=output-file=~A:~A ~A ~
-                               --experimental_allow_proto3_optional"
-                          search-path
-                          (file-namestring output-file)
-                          (directory-namestring output-file)
-                          source-file-argument)))
-    (multiple-value-bind (output error-output status)
-        (uiop:run-program command :output '(:string :stripped t)
-                                  :error-output :output
-                                  :ignore-error-status t)
-      (declare (ignore error-output))
-      (unless (zerop status)
-        (error 'protobuf-compile-failed
-               :description (format nil "Failed to compile proto file. Command: ~S Error: ~S"
-                                    command output)
-               :context-format "~/asdf-action::format-action/"
-               :context-arguments `((,operation . ,component)))))))
+         (source-lisp (component-pathname component))
+         (output-file (first (output-files operation component))))
+    ;; When a pre-generated .lisp exists at the source location (e.g. from
+    ;; cl-repository overlay) and is at least as fresh as the .proto input,
+    ;; use it directly instead of invoking protoc.  ASDF output-translations
+    ;; may redirect output-file to the cache; in that case, copy the
+    ;; pre-generated file there.
+    (when (and (probe-file source-lisp)
+               (or (not (probe-file source-file))
+                   (>= (file-write-date source-lisp)
+                       (file-write-date source-file))))
+      (unless (equal (namestring source-lisp) (namestring output-file))
+        (ensure-directories-exist output-file)
+        (uiop:copy-file source-lisp output-file))
+      (return-from perform))
+    (let* ((source-file-argument (if (proto-pathname component)
+                                     (file-namestring source-file)
+                                     (namestring source-file)))
+           (search-path (get-search-paths component))
+           (protoc-bin (or (find-protobuf-tool "protoc") "protoc"))
+           (plugin-path (find-protobuf-tool "protoc-gen-cl-pb"))
+           (plugin-arg (if plugin-path
+                           (format nil " --plugin=protoc-gen-cl-pb=~A" plugin-path)
+                           ""))
+           (command (format nil "~A --proto_path=~{~A~^:~} --cl-pb_out=output-file=~A:~A ~A~A ~
+                                 --experimental_allow_proto3_optional"
+                            protoc-bin
+                            search-path
+                            (file-namestring output-file)
+                            (directory-namestring output-file)
+                            source-file-argument
+                            plugin-arg)))
+      (multiple-value-bind (output error-output status)
+          (uiop:run-program command :output '(:string :stripped t)
+                                    :error-output :output
+                                    :ignore-error-status t)
+        (declare (ignore error-output))
+        (unless (zerop status)
+          (error 'protobuf-compile-failed
+                 :description (format nil "Failed to compile proto file. Command: ~S Error: ~S"
+                                      command output)
+                 :context-format "~/asdf-action::format-action/"
+                 :context-arguments `((,operation . ,component))))))))
 
 (defmethod asdf::component-self-dependencies :around ((op load-op) (c protobuf-source-file))
   "Removes PROTO-TO-LISP operations from self dependencies.  Otherwise, the Lisp

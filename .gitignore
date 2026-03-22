@@ -2,4 +2,26 @@ protoc/*.o
 protoc/*.cc
 protoc/*.h
 protoc/protoc-gen-lisp
+protoc/protoc-gen-cl-pb
 protoc/protoc_middleman
+protoc/build/
+protoc/CMakeCache.txt
+protoc/CMakeFiles/
+protoc/cmake_install.cmake
+
+# Pre-generated well-known-types .lisp files (build artifacts from proto-to-lisp)
+/descriptor.lisp
+/any.lisp
+/source_context.lisp
+/type.lisp
+/api.lisp
+/duration.lisp
+/empty.lisp
+/field_mask.lisp
+/timestamp.lisp
+/wrappers.lisp
+/struct.lisp
+
+# OCI packaging build artifacts
+/lib/
+/generated/
