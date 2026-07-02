@@ -276,8 +276,12 @@ jobs:
                          :overlays overlays))
                  (result (cl-repository-packager/build-matrix:build-package spec)))
             (format t "~%Overlays: ~{~a~^, ~}~%" platform-lines)
+            ;; :skip-catalog -- the shared <namespace>/catalog GHCR package is
+            ;; writable only by the repo whose workflow created it (grpc); this
+            ;; repo's GITHUB_TOKEN gets 403 there.  Re-enable once this repo is
+            ;; granted write access in the catalog package's Actions settings.
             (cl-repository-packager/publisher:publish-package
-              reg namespace version result spec)
+              reg namespace version result spec :skip-catalog t)
             (format t "Published cl-protobufs:~a to ~a/~a~%" version registry-url namespace))
           LISP
 
