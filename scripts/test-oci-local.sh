@@ -15,6 +15,10 @@ CONTAINER_NAME="cl-oci-test-registry"
 CL_SYSTEMS_DIR="${HOME}/.local/share/cl-systems"
 TMPDIR_PULL="$(mktemp -d)"
 BUILD_IMAGE="cl-protobufs-builder:latest"
+# Stage overlays OUTSIDE the checkout: build-package tars the whole source
+# dir into the source layer, so lib/ and generated/ staged in the repo would
+# be swept into the published source tarball. /tmp is docker-shareable.
+OVERLAY_ROOT="$(mktemp -d /tmp/cl-pb-overlays.XXXXXX)"
 # Official static protoc shipped in the native overlay (brew's protoc is
 # dynamically linked against brew libs and breaks on machines without them).
 PROTOC_VERSION="34.1"
@@ -32,8 +36,7 @@ fetch_protoc() {
 cleanup() {
   echo "==> Cleanup"
   docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-  rm -rf "$TMPDIR_PULL"
-  rm -rf "${PROJECT_DIR:?}/lib" "${PROJECT_DIR:?}/generated"
+  rm -rf "$TMPDIR_PULL" "$OVERLAY_ROOT"
 }
 trap cleanup EXIT
 
@@ -72,15 +75,14 @@ echo "    Built: $(file protoc-gen-cl-pb | cut -d: -f2)"
 cd "${PROJECT_DIR}"
 
 echo "==> Pre-generating well-known-types .lisp (darwin/arm64)"
-generate_wkt generated/darwin-arm64 protoc/protoc-gen-cl-pb
-echo "    Generated $(ls generated/darwin-arm64/*.lisp | wc -l | tr -d ' ') .lisp files"
+generate_wkt "${OVERLAY_ROOT}/generated/darwin-arm64" protoc/protoc-gen-cl-pb
+echo "    Generated $(ls "${OVERLAY_ROOT}"/generated/darwin-arm64/*.lisp | wc -l | tr -d ' ') .lisp files"
 
 echo "==> Collecting native overlay artifacts (darwin/arm64)"
-rm -rf lib/darwin-arm64
-mkdir -p lib/darwin-arm64
-scripts/bundle-protoc-plugin.sh protoc/protoc-gen-cl-pb lib/darwin-arm64 > /tmp/cl-pb-bundle.log 2>&1 \
+mkdir -p "${OVERLAY_ROOT}/lib/darwin-arm64"
+scripts/bundle-protoc-plugin.sh protoc/protoc-gen-cl-pb "${OVERLAY_ROOT}/lib/darwin-arm64" > /tmp/cl-pb-bundle.log 2>&1 \
   || { tail -20 /tmp/cl-pb-bundle.log; exit 1; }
-fetch_protoc osx-aarch_64 lib/darwin-arm64
+fetch_protoc osx-aarch_64 "${OVERLAY_ROOT}/lib/darwin-arm64"
 
 # ══════════════════════════════════════════════════════════════════════
 # linux/amd64 — Docker build
@@ -97,6 +99,7 @@ fi
 echo "==> Building protoc-gen-cl-pb + generating .lisp (linux/amd64) via Docker"
 docker run --rm --platform linux/amd64 \
   -v "${PROJECT_DIR}:/src" \
+  -v "${OVERLAY_ROOT}:/out" \
   -w /src \
   "$BUILD_IMAGE" \
   bash -c '
@@ -107,27 +110,27 @@ docker run --rm --platform linux/amd64 \
     cmake --build /tmp/protoc-build --parallel "$(nproc)" 2>&1 | tail -3
     echo "Built: $(file /tmp/protoc-build/protoc-gen-cl-pb | cut -d: -f2)"
 
-    mkdir -p generated/linux-amd64
+    mkdir -p /out/generated/linux-amd64
     for proto in descriptor any source_context type api duration empty field_mask timestamp wrappers struct; do
       protoc --proto_path=google/protobuf/ \
         --plugin=protoc-gen-cl-pb=/tmp/protoc-build/protoc-gen-cl-pb \
-        "--cl-pb_out=output-file=${proto}.lisp:generated/linux-amd64/" \
+        "--cl-pb_out=output-file=${proto}.lisp:/out/generated/linux-amd64/" \
         "${proto}.proto" \
         --experimental_allow_proto3_optional
     done
-    echo "Generated $(ls generated/linux-amd64/*.lisp | wc -l) .lisp files"
+    echo "Generated $(ls /out/generated/linux-amd64/*.lisp | wc -l) .lisp files"
 
-    mkdir -p lib/linux-amd64
-    scripts/bundle-protoc-plugin.sh /tmp/protoc-build/protoc-gen-cl-pb lib/linux-amd64 | tail -2
+    mkdir -p /out/lib/linux-amd64
+    scripts/bundle-protoc-plugin.sh /tmp/protoc-build/protoc-gen-cl-pb /out/lib/linux-amd64 | tail -2
     curl -fsSL -o /tmp/protoc.zip \
       "https://github.com/protocolbuffers/protobuf/releases/download/v'"${PROTOC_VERSION}"'/protoc-'"${PROTOC_VERSION}"'-linux-x86_64.zip"
-    unzip -j -o -q /tmp/protoc.zip bin/protoc -d lib/linux-amd64
-    chmod 755 lib/linux-amd64/protoc
+    unzip -j -o -q /tmp/protoc.zip bin/protoc -d /out/lib/linux-amd64
+    chmod 755 /out/lib/linux-amd64/protoc
   '
 
 echo "==> Built artifacts:"
-find "${PROJECT_DIR}/lib" -type f
-find "${PROJECT_DIR}/generated" -name '*.lisp' | wc -l | xargs -I{} echo "    {} generated .lisp files total"
+find "${OVERLAY_ROOT}/lib" -type f
+find "${OVERLAY_ROOT}/generated" -name '*.lisp' | wc -l | xargs -I{} echo "    {} generated .lisp files total"
 
 # ── Start local OCI registry ─────────────────────────────────────────
 echo "==> Starting local OCI registry on ${REGISTRY}"
@@ -170,6 +173,7 @@ cat > "${TMPDIR_PULL}/publish.lisp" <<'LISP'
        (registry-url (uiop:getenv "OCI_REGISTRY"))
        (namespace (uiop:getenv "OCI_NAMESPACE"))
        (source-dir (uiop:getenv "SOURCE_DIR"))
+       (overlay-root (uiop:ensure-directory-pathname (uiop:getenv "OVERLAY_ROOT")))
        (reg (cl-oci-client/registry:make-registry registry-url))
        (generated-files '(("descriptor.lisp" . "descriptor.lisp")
                           ("any.lisp" . "any.lisp")
@@ -195,7 +199,7 @@ cat > "${TMPDIR_PULL}/publish.lisp" <<'LISP'
                (flet ((make-overlay (os arch)
                         (let* ((prefix (format nil "~a-~a" os arch))
                                (lib-dir (merge-pathnames (format nil "lib/~a/" prefix)
-                                                         (pathname source-dir)))
+                                                         overlay-root))
                                ;; protoc + protoc-gen-cl-pb + bundled shared libs.
                                ;; NOTE: (directory #p"*") skips files with extensions
                                ;; on SBCL; uiop:directory-files gets all of them.
@@ -212,7 +216,10 @@ cat > "${TMPDIR_PULL}/publish.lisp" <<'LISP'
                                    :files native-files)
                              (list :role "generated-source"
                                    :files (mapcar (lambda (pair)
-                                                    (cons (format nil "generated/~a/~a" prefix (car pair))
+                                                    (cons (namestring
+                                                           (merge-pathnames
+                                                            (format nil "generated/~a/~a" prefix (car pair))
+                                                            overlay-root))
                                                           (cdr pair)))
                                                   generated-files)))))))
                  (list (make-overlay "darwin" "arm64")
@@ -227,6 +234,7 @@ PKG_VERSION="$VERSION" \
 OCI_REGISTRY="http://${REGISTRY}" \
 OCI_NAMESPACE="$NAMESPACE" \
 SOURCE_DIR="${PROJECT_DIR}/" \
+OVERLAY_ROOT="${OVERLAY_ROOT}/" \
 sbcl --noinform --non-interactive --load "${TMPDIR_PULL}/publish.lisp"
 
 # ── Verify ────────────────────────────────────────────────────────────

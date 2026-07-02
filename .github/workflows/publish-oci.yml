@@ -124,27 +124,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Stage overlays OUTSIDE the checkout: build-package tars the whole
+      # source-dir into the source layer, so anything staged inside the repo
+      # would be swept into every published source tarball.
       - name: Download all native artifacts
         uses: actions/download-artifact@v4
         with:
-          path: native-artifacts/
+          path: ${{ runner.temp }}/native-artifacts/
 
       - name: Arrange overlay directories
         run: |
-          for dir in native-artifacts/native-*; do
+          OVERLAY_ROOT="${RUNNER_TEMP}/overlays"
+          echo "OVERLAY_ROOT=${OVERLAY_ROOT}" >> "$GITHUB_ENV"
+          for dir in "${RUNNER_TEMP}"/native-artifacts/native-*; do
             [ -d "$dir" ] || continue
             slug=$(basename "$dir" | sed 's/^native-//')
             os=$(echo "$slug" | cut -d- -f1)
             arch=$(echo "$slug" | cut -d- -f2)
-            mkdir -p "lib/${os}-${arch}" "generated/${os}-${arch}"
-            cp "$dir"/lib/* "lib/${os}-${arch}/"
-            cp "$dir"/generated/* "generated/${os}-${arch}/"
-            chmod +x "lib/${os}-${arch}/"*
+            mkdir -p "${OVERLAY_ROOT}/lib/${os}-${arch}" "${OVERLAY_ROOT}/generated/${os}-${arch}"
+            cp "$dir"/lib/* "${OVERLAY_ROOT}/lib/${os}-${arch}/"
+            cp "$dir"/generated/* "${OVERLAY_ROOT}/generated/${os}-${arch}/"
+            chmod +x "${OVERLAY_ROOT}/lib/${os}-${arch}/"*
             echo "${os}/${arch}" >> /tmp/platforms.txt
           done
           echo "Platforms:"; cat /tmp/platforms.txt
-          find lib/ -type f
-          find generated/ -type f
+          find "${OVERLAY_ROOT}" -type f
 
       - name: Install SBCL
         run: sudo apt-get update && sudo apt-get install -y sbcl
@@ -226,6 +230,7 @@ jobs:
                                     ("timestamp.lisp" . "timestamp.lisp")
                                     ("wrappers.lisp" . "wrappers.lisp")
                                     ("struct.lisp" . "struct.lisp")))
+                 (overlay-root (uiop:ensure-directory-pathname (uiop:getenv "OVERLAY_ROOT")))
                  (overlays
                    (loop for line in platform-lines
                          for slash = (position #\/ line)
@@ -235,7 +240,7 @@ jobs:
                                 (arch (subseq line (1+ slash)))
                                 (prefix (format nil "~a-~a" os arch))
                                 (lib-dir (merge-pathnames (format nil "lib/~a/" prefix)
-                                                          (uiop:getcwd)))
+                                                          overlay-root))
                                 ;; protoc + protoc-gen-cl-pb + its bundled shared libs.
                                 ;; NOTE: (directory #p"*") would skip files with
                                 ;; extensions on SBCL; uiop:directory-files gets all.
@@ -253,7 +258,10 @@ jobs:
                                (list :role "generated-source"
                                      :files (mapcar
                                               (lambda (pair)
-                                                (cons (format nil "generated/~a/~a" prefix (car pair))
+                                                (cons (namestring
+                                                       (merge-pathnames
+                                                        (format nil "generated/~a/~a" prefix (car pair))
+                                                        overlay-root))
                                                       (cdr pair)))
                                               generated-files)))))))
                  (spec (make-instance 'cl-repository-packager/build-matrix:package-spec
