@@ -27,6 +27,10 @@ and functionality for working with them."
                :cl-base64
                :local-time
                :float-features)
+  ;; NOTE: minimal overlay spec for local package-op builds.  The CI publish
+  ;; pipeline (.github/workflows/publish-oci.yml) builds the authoritative
+  ;; overlays dynamically -- native/ additionally carries the shared libraries
+  ;; bundled next to protoc-gen-cl-pb by scripts/bundle-protoc-plugin.sh.
   :properties (:cl-repo (:provides ("cl-protobufs" "cl-protobufs.asdf")
                           :overlays ((:platform (:os "darwin" :arch "arm64")
                                       :layers ((:role "native-library"

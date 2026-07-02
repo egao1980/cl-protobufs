@@ -15,12 +15,25 @@ CONTAINER_NAME="cl-oci-test-registry"
 CL_SYSTEMS_DIR="${HOME}/.local/share/cl-systems"
 TMPDIR_PULL="$(mktemp -d)"
 BUILD_IMAGE="cl-protobufs-builder:latest"
+# Official static protoc shipped in the native overlay (brew's protoc is
+# dynamically linked against brew libs and breaks on machines without them).
+PROTOC_VERSION="34.1"
+
+fetch_protoc() {
+  local platform="$1" dest_dir="$2" zip
+  zip="$(mktemp -t protoc-zip)"
+  curl -fsSL -o "$zip" \
+    "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${platform}.zip"
+  unzip -j -o -q "$zip" bin/protoc -d "$dest_dir"
+  chmod 755 "${dest_dir}/protoc"
+  rm -f "$zip"
+}
 
 cleanup() {
   echo "==> Cleanup"
   docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
   rm -rf "$TMPDIR_PULL"
-  rm -rf "${PROJECT_DIR}/lib" "${PROJECT_DIR}/generated"
+  rm -rf "${PROJECT_DIR:?}/lib" "${PROJECT_DIR:?}/generated"
 }
 trap cleanup EXIT
 
@@ -65,8 +78,9 @@ echo "    Generated $(ls generated/darwin-arm64/*.lisp | wc -l | tr -d ' ') .lis
 echo "==> Collecting native overlay artifacts (darwin/arm64)"
 rm -rf lib/darwin-arm64
 mkdir -p lib/darwin-arm64
-install -m 755 "$(realpath "$(brew --prefix)/bin/protoc")" lib/darwin-arm64/protoc
-install -m 755 protoc/protoc-gen-cl-pb lib/darwin-arm64/protoc-gen-cl-pb
+scripts/bundle-protoc-plugin.sh protoc/protoc-gen-cl-pb lib/darwin-arm64 > /tmp/cl-pb-bundle.log 2>&1 \
+  || { tail -20 /tmp/cl-pb-bundle.log; exit 1; }
+fetch_protoc osx-aarch_64 lib/darwin-arm64
 
 # ══════════════════════════════════════════════════════════════════════
 # linux/amd64 — Docker build
@@ -104,8 +118,11 @@ docker run --rm --platform linux/amd64 \
     echo "Generated $(ls generated/linux-amd64/*.lisp | wc -l) .lisp files"
 
     mkdir -p lib/linux-amd64
-    install -m 755 "$(realpath "$(brew --prefix)/bin/protoc")" lib/linux-amd64/protoc
-    install -m 755 /tmp/protoc-build/protoc-gen-cl-pb lib/linux-amd64/protoc-gen-cl-pb
+    scripts/bundle-protoc-plugin.sh /tmp/protoc-build/protoc-gen-cl-pb lib/linux-amd64 | tail -2
+    curl -fsSL -o /tmp/protoc.zip \
+      "https://github.com/protocolbuffers/protobuf/releases/download/v'"${PROTOC_VERSION}"'/protoc-'"${PROTOC_VERSION}"'-linux-x86_64.zip"
+    unzip -j -o -q /tmp/protoc.zip bin/protoc -d lib/linux-amd64
+    chmod 755 lib/linux-amd64/protoc
   '
 
 echo "==> Built artifacts:"
@@ -176,16 +193,23 @@ cat > "${TMPDIR_PULL}/publish.lisp" <<'LISP'
                :provides '("cl-protobufs" "cl-protobufs.asdf")
                :overlays
                (flet ((make-overlay (os arch)
-                        (let ((prefix (format nil "~a-~a" os arch)))
+                        (let* ((prefix (format nil "~a-~a" os arch))
+                               (lib-dir (merge-pathnames (format nil "lib/~a/" prefix)
+                                                         (pathname source-dir)))
+                               ;; protoc + protoc-gen-cl-pb + bundled shared libs.
+                               ;; NOTE: (directory #p"*") skips files with extensions
+                               ;; on SBCL; uiop:directory-files gets all of them.
+                               (native-files
+                                 (loop for p in (uiop:directory-files lib-dir)
+                                       collect (cons (namestring p) (file-namestring p)))))
+                          (unless native-files
+                            (error "No native files found under ~a" lib-dir))
                           (make-instance 'cl-repository-packager/build-matrix:overlay-spec
                             :os os :arch arch
                             :layers
                             (list
                              (list :role "native-library"
-                                   :files (list
-                                           (cons (format nil "lib/~a/protoc" prefix) "protoc")
-                                           (cons (format nil "lib/~a/protoc-gen-cl-pb" prefix)
-                                                 "protoc-gen-cl-pb")))
+                                   :files native-files)
                              (list :role "generated-source"
                                    :files (mapcar (lambda (pair)
                                                     (cons (format nil "generated/~a/~a" prefix (car pair))

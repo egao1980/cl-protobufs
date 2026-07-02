@@ -40,6 +40,20 @@ NATIVE_DIR="${INSTALL_DIR}/cl-protobufs/native"
 if [ -d "$NATIVE_DIR" ]; then
   echo "    native/ directory exists:"
   ls -la "$NATIVE_DIR/"
+  # The bundled tools must be self-contained: run them, don't just stat them.
+  chmod +x "${NATIVE_DIR}/protoc" "${NATIVE_DIR}/protoc-gen-cl-pb" 2>/dev/null || true
+  if "${NATIVE_DIR}/protoc" --version; then
+    echo "    OK: bundled protoc runs"
+  else
+    echo "    FAIL: bundled protoc does not run on this machine" >&2
+    exit 1
+  fi
+  if "${NATIVE_DIR}/protoc-gen-cl-pb" </dev/null >/dev/null; then
+    echo "    OK: bundled protoc-gen-cl-pb runs"
+  else
+    echo "    FAIL: bundled protoc-gen-cl-pb does not run on this machine" >&2
+    exit 1
+  fi
 else
   echo "    WARNING: native/ directory not found - overlay may not have been extracted"
 fi

@@ -17,6 +17,9 @@ on:
 
 env:
   DEFAULT_REGISTRY: ghcr.io
+  # Official static protoc release shipped in the native overlay (zero runtime deps,
+  # unlike brew's protoc which is dynamically linked against brew libs).
+  PROTOC_VERSION: "34.1"
 
 jobs:
   build:
@@ -27,12 +30,15 @@ jobs:
           - os: linux
             arch: amd64
             runner: ubuntu-latest
+            protoc_platform: linux-x86_64
           - os: linux
             arch: arm64
-            runner: ubuntu-24.04-arm64
+            runner: ubuntu-24.04-arm
+            protoc_platform: linux-aarch_64
           - os: darwin
             arch: arm64
             runner: macos-latest
+            protoc_platform: osx-aarch_64
 
     runs-on: ${{ matrix.runner }}
     steps:
@@ -62,7 +68,7 @@ jobs:
       - name: Install build deps (Linux)
         if: matrix.os == 'linux'
         run: |
-          sudo apt-get update && sudo apt-get install -y build-essential
+          sudo apt-get update && sudo apt-get install -y build-essential patchelf
           brew install protobuf cmake pkg-config
 
       - name: Install build deps (macOS)
@@ -91,10 +97,16 @@ jobs:
       - name: Collect artifacts
         run: |
           mkdir -p artifacts/lib artifacts/generated
-          cp "$(brew --prefix)/bin/protoc" artifacts/lib/protoc
-          cp protoc/build/protoc-gen-cl-pb artifacts/lib/protoc-gen-cl-pb
+          # Self-contained plugin: bundle brew-linked shared libs + rewrite rpaths
+          chmod +x scripts/bundle-protoc-plugin.sh
+          ./scripts/bundle-protoc-plugin.sh protoc/build/protoc-gen-cl-pb artifacts/lib
+          # Official static protoc release binary (portable, no dynamic deps)
+          curl -fsSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${{ matrix.protoc_platform }}.zip"
+          unzip -j -o /tmp/protoc.zip bin/protoc -d artifacts/lib
           cp generated/*.lisp artifacts/generated/
           chmod +x artifacts/lib/protoc artifacts/lib/protoc-gen-cl-pb
+          artifacts/lib/protoc --version
 
       - name: Upload native artifacts
         uses: actions/upload-artifact@v4
@@ -221,16 +233,23 @@ jobs:
                          collect
                          (let* ((os (subseq line 0 slash))
                                 (arch (subseq line (1+ slash)))
-                                (prefix (format nil "~a-~a" os arch)))
+                                (prefix (format nil "~a-~a" os arch))
+                                (lib-dir (merge-pathnames (format nil "lib/~a/" prefix)
+                                                          (uiop:getcwd)))
+                                ;; protoc + protoc-gen-cl-pb + its bundled shared libs.
+                                ;; NOTE: (directory #p"*") would skip files with
+                                ;; extensions on SBCL; uiop:directory-files gets all.
+                                (native-files
+                                  (loop for p in (uiop:directory-files lib-dir)
+                                        collect (cons (namestring p) (file-namestring p)))))
+                           (unless native-files
+                             (error "No native files found under ~a" lib-dir))
                            (make-instance 'cl-repository-packager/build-matrix:overlay-spec
                              :os os :arch arch
                              :layers
                              (list
                                (list :role "native-library"
-                                     :files (list
-                                             (cons (format nil "lib/~a/protoc" prefix) "protoc")
-                                             (cons (format nil "lib/~a/protoc-gen-cl-pb" prefix)
-                                                   "protoc-gen-cl-pb")))
+                                     :files native-files)
                                (list :role "generated-source"
                                      :files (mapcar
                                               (lambda (pair)
