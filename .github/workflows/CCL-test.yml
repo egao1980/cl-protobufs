@@ -27,7 +27,7 @@ jobs:
           ./ccl/lx86cl64 --load "$GITHUB_WORKSPACE/quicklisp/setup.lisp" --eval '(ql-util:without-prompting (ql:add-to-init-file)) (quit)'
 
       - name: Download repo
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           path: quicklisp/local-projects/cl-protobufs
 
