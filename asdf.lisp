@@ -130,20 +130,45 @@ search path will be the directory of the parent component."
   ()
   (:documentation "Condition signalled when translating a .proto file into Lisp code fails."))
 
+(defvar *protobuf-tool-cache* (make-hash-table :test #'equal)
+  "Maps tool name -> probed native binary namestring, or :unusable.")
+
+(defun protobuf-tool-runs-p (path name)
+  "T when the binary at PATH actually executes on this machine.  Bundled
+binaries can fail to exec (missing dynamic deps, foreign arch), in which
+case callers should fall back to PATH lookup."
+  (ignore-errors
+    (zerop (nth-value 2 (uiop:run-program
+                         ;; protoc exits 0 on --version; a protoc plugin
+                         ;; reads a CodeGeneratorRequest from stdin and
+                         ;; exits 0 on an empty (valid) request.
+                         (if (string= name "protoc")
+                             (list path "--version")
+                             (list path))
+                         :input nil :output nil :error-output nil
+                         :ignore-error-status t)))))
+
 (defun find-protobuf-tool (name)
-  "Find NAME (e.g. \"protoc\") in the cl-protobufs native/ dir installed by cl-repository.
-Falls back to NIL if not found, letting callers use PATH lookup instead."
+  "Find NAME (e.g. \"protoc\") in the cl-protobufs native/ dir installed by
+cl-repository and verify it runs.  Returns NIL when absent or non-functional,
+letting callers use PATH lookup instead."
+  (let ((cached (gethash name *protobuf-tool-cache*)))
+    (when cached
+      (return-from find-protobuf-tool (unless (eq cached :unusable) cached))))
   (let* ((sys (asdf:find-system :cl-protobufs.asdf nil))
          (src-dir (when sys (asdf:system-source-directory sys)))
          (native (when src-dir (merge-pathnames "native/" src-dir)))
-         (path (when native (merge-pathnames name native))))
+         (path (when native (merge-pathnames name native)))
+         (result :unusable))
     (when (and path (probe-file path))
-      ;; OCI tarballs may strip execute bits; ensure the binary is executable
       (let ((ns (namestring path)))
+        ;; OCI tarballs may strip execute bits; ensure the binary is executable
         (ignore-errors
-          (uiop:run-program (list "chmod" "+x" ns)
-                            :ignore-error-status t))
-        ns))))
+          (uiop:run-program (list "chmod" "+x" ns) :ignore-error-status t))
+        (when (protobuf-tool-runs-p ns name)
+          (setf result ns))))
+    (setf (gethash name *protobuf-tool-cache*) result)
+    (unless (eq result :unusable) result)))
 
 (defmethod perform :before ((operation proto-to-lisp) (component protobuf-source-file))
   (map nil #'ensure-directories-exist (output-files operation component)))
@@ -171,17 +196,17 @@ Falls back to NIL if not found, letting callers use PATH lookup instead."
            (search-path (get-search-paths component))
            (protoc-bin (or (find-protobuf-tool "protoc") "protoc"))
            (plugin-path (find-protobuf-tool "protoc-gen-cl-pb"))
-           (plugin-arg (if plugin-path
-                           (format nil " --plugin=protoc-gen-cl-pb=~A" plugin-path)
-                           ""))
-           (command (format nil "~A --proto_path=~{~A~^:~} --cl-pb_out=output-file=~A:~A ~A~A ~
-                                 --experimental_allow_proto3_optional"
-                            protoc-bin
-                            search-path
-                            (file-namestring output-file)
-                            (directory-namestring output-file)
-                            source-file-argument
-                            plugin-arg)))
+           ;; Argument list (not a shell string): paths may contain spaces
+           ;; and must never be subject to shell interpretation.
+           (command `(,protoc-bin
+                      ,(format nil "--proto_path=~{~A~^:~}" search-path)
+                      ,(format nil "--cl-pb_out=output-file=~A:~A"
+                               (file-namestring output-file)
+                               (directory-namestring output-file))
+                      ,@(when plugin-path
+                          (list (format nil "--plugin=protoc-gen-cl-pb=~A" plugin-path)))
+                      ,source-file-argument
+                      "--experimental_allow_proto3_optional")))
       (multiple-value-bind (output error-output status)
           (uiop:run-program command :output '(:string :stripped t)
                                     :error-output :output
