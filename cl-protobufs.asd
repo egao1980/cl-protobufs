@@ -156,38 +156,29 @@ and functionality for working with them."
     :depends-on ("models" "parsing" "schema" "serialization")
     :components
     ((:file "message-api")))
+   ;; Vendored WKT Lisp (2.0-rc1 generated-source). Regular :file so load
+   ;; does not require protoc — Windows / source-only installs work.
    ;; TODO(michaeldelago) Update well-known types to use their full path (ie google/protobuf/descriptor).
    (:module "well-known-types"
     :serial t
     :pathname ""
     :depends-on ("models" "misc")
     :components
-    ((:protobuf-source-file "descriptor"
-      :proto-pathname "google/protobuf/descriptor.proto")
-     (:protobuf-source-file "any"
-      :proto-pathname "google/protobuf/any.proto")
-     (:protobuf-source-file "source_context"
-      :proto-pathname "google/protobuf/source_context.proto")
-     #-ccl
-     (:protobuf-source-file "type"
-      :proto-pathname "google/protobuf/type.proto"
-      :proto-search-path ("google/protobuf/"))
-     #-ccl
-     (:protobuf-source-file "api"
-      :proto-pathname "google/protobuf/api.proto"
-      :proto-search-path ("google/protobuf/"))
-     (:protobuf-source-file "duration"
-      :proto-pathname "google/protobuf/duration.proto")
-     (:protobuf-source-file "empty"
-      :proto-pathname "google/protobuf/empty.proto")
-     (:protobuf-source-file "field_mask"
-      :proto-pathname "google/protobuf/field_mask.proto")
-     (:protobuf-source-file "timestamp"
-      :proto-pathname "google/protobuf/timestamp.proto")
-     (:protobuf-source-file "wrappers"
-      :proto-pathname "google/protobuf/wrappers.proto")
-     (:protobuf-source-file "struct"
-      :proto-pathname "google/protobuf/struct.proto")
+    ((:module "generated"
+      :pathname "wkt"
+      :serial t
+      :components
+      ((:file "descriptor")
+       (:file "any")
+       (:file "source_context")
+       #-ccl (:file "type")
+       #-ccl (:file "api")
+       (:file "duration")
+       (:file "empty")
+       (:file "field_mask")
+       (:file "timestamp")
+       (:file "wrappers")
+       (:file "struct")))
      (:file "well-known-types")))
    (:module "json"
     :serial t
