@@ -250,7 +250,7 @@ jobs:
                  (result (cl-repository-packager/build-matrix:build-package spec)))
             (format t "~%Overlays: ~{~a~^, ~}~%" platform-lines)
             (cl-repository-packager/publisher:publish-package
-              reg namespace version result spec)
+              reg namespace version result spec :skip-catalog t)
             (format t "Published cl-protobufs:~a to ~a/~a~%" version registry-url namespace))
           LISP
 
