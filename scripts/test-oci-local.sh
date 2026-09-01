@@ -3,7 +3,7 @@
 # Builds both darwin/arm64 (natively) and linux/amd64 (via Docker) overlays,
 # publishes to a local OCI registry, and verifies the resulting image index.
 #
-# Prerequisites: docker, sbcl, oras, brew (protobuf, cmake, pkg-config)
+# Prerequisites: docker, ros (setup-lisp / cl-repository-client), oras, brew (protobuf, cmake, pkg-config)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -12,8 +12,6 @@ REGISTRY="localhost:5050"
 NAMESPACE="cl-systems"
 VERSION="${1:-2.0}"
 CONTAINER_NAME="cl-oci-test-registry"
-CL_SYSTEMS_DIR="${HOME}/.local/share/cl-systems"
-TMPDIR_PULL="$(mktemp -d)"
 BUILD_IMAGE="cl-protobufs-builder:latest"
 # Stage overlays OUTSIDE the checkout: build-package tars the whole source
 # dir into the source layer, so lib/ and generated/ staged in the repo would
@@ -36,13 +34,13 @@ fetch_protoc() {
 cleanup() {
   echo "==> Cleanup"
   docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-  rm -rf "$TMPDIR_PULL" "$OVERLAY_ROOT"
+  rm -rf "$OVERLAY_ROOT"
 }
 trap cleanup EXIT
 
 # ── Prerequisites ────────────────────────────────────────────────────
 echo "==> Checking prerequisites"
-for cmd in docker sbcl oras cmake protoc; do
+for cmd in docker ros oras cmake protoc; do
   if ! command -v "$cmd" &>/dev/null; then
     echo "ERROR: $cmd not found. Install it first." >&2
     exit 1
@@ -138,104 +136,21 @@ docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 docker run -d -p 5050:5000 --name "$CONTAINER_NAME" registry:2
 sleep 1
 
-# ── Pull cl-repository-packager ──────────────────────────────────────
-CL_REPO_TAG="0.8.0"
-CL_REPO_IMAGE="ghcr.io/egao1980/cl-repository/cl-repository-packager"
-echo "==> Pulling cl-repository-packager:${CL_REPO_TAG} from GHCR"
-rm -rf "$TMPDIR_PULL"
-mkdir -p "$TMPDIR_PULL"
-mkdir -p "$CL_SYSTEMS_DIR"
-rm -rf "$CL_SYSTEMS_DIR"/cl-oci-*
-oras pull "${CL_REPO_IMAGE}:${CL_REPO_TAG}" -o "$TMPDIR_PULL/"
-
-for f in "$TMPDIR_PULL"/*.tar.gz; do
-  [ -f "$f" ] && tar -xzf "$f" -C "$CL_SYSTEMS_DIR/"
-done
-echo "    Extracted to ${CL_SYSTEMS_DIR}:"
-ls "$CL_SYSTEMS_DIR/"
-
-# ── Publish OCI package ──────────────────────────────────────────────
+# ── Publish OCI package (setup-lisp client + ensure-systems, no QL) ──
 echo "==> Publishing OCI package to ${REGISTRY}/${NAMESPACE}/cl-protobufs:${VERSION}"
-cat > "${TMPDIR_PULL}/publish.lisp" <<'LISP'
-(require :asdf)
-
-(asdf:initialize-source-registry
-  '(:source-registry
-    (:tree (:home ".local/share/cl-systems/"))
-    :inherit-configuration))
-
-(let ((ql-setup (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))))
-  (when (probe-file ql-setup) (load ql-setup)))
-
-(ql:quickload :cl-repository-packager)
-
-(let* ((version (uiop:getenv "PKG_VERSION"))
-       (registry-url (uiop:getenv "OCI_REGISTRY"))
-       (namespace (uiop:getenv "OCI_NAMESPACE"))
-       (source-dir (uiop:getenv "SOURCE_DIR"))
-       (overlay-root (uiop:ensure-directory-pathname (uiop:getenv "OVERLAY_ROOT")))
-       (reg (cl-oci-client/registry:make-registry registry-url))
-       (generated-files '(("descriptor.lisp" . "descriptor.lisp")
-                          ("any.lisp" . "any.lisp")
-                          ("source_context.lisp" . "source_context.lisp")
-                          ("type.lisp" . "type.lisp")
-                          ("api.lisp" . "api.lisp")
-                          ("duration.lisp" . "duration.lisp")
-                          ("empty.lisp" . "empty.lisp")
-                          ("field_mask.lisp" . "field_mask.lisp")
-                          ("timestamp.lisp" . "timestamp.lisp")
-                          ("wrappers.lisp" . "wrappers.lisp")
-                          ("struct.lisp" . "struct.lisp")))
-       (spec (make-instance 'cl-repository-packager/build-matrix:package-spec
-               :name "cl-protobufs"
-               :version version
-               :source-dir (pathname source-dir)
-               :license "MIT"
-               :description "Protocol Buffers for Common Lisp"
-               :depends-on '("closer-mop" "alexandria" "trivial-garbage"
-                             "cl-base64" "local-time" "float-features")
-               :provides '("cl-protobufs" "cl-protobufs.asdf")
-               :overlays
-               (flet ((make-overlay (os arch)
-                        (let* ((prefix (format nil "~a-~a" os arch))
-                               (lib-dir (merge-pathnames (format nil "lib/~a/" prefix)
-                                                         overlay-root))
-                               ;; protoc + protoc-gen-cl-pb + bundled shared libs.
-                               ;; NOTE: (directory #p"*") skips files with extensions
-                               ;; on SBCL; uiop:directory-files gets all of them.
-                               (native-files
-                                 (loop for p in (uiop:directory-files lib-dir)
-                                       collect (cons (namestring p) (file-namestring p)))))
-                          (unless native-files
-                            (error "No native files found under ~a" lib-dir))
-                          (make-instance 'cl-repository-packager/build-matrix:overlay-spec
-                            :os os :arch arch
-                            :layers
-                            (list
-                             (list :role "native-library"
-                                   :files native-files)
-                             (list :role "generated-source"
-                                   :files (mapcar (lambda (pair)
-                                                    (cons (namestring
-                                                           (merge-pathnames
-                                                            (format nil "generated/~a/~a" prefix (car pair))
-                                                            overlay-root))
-                                                          (cdr pair)))
-                                                  generated-files)))))))
-                 (list (make-overlay "darwin" "arm64")
-                       (make-overlay "linux" "amd64")))))
-       (result (cl-repository-packager/build-matrix:build-package spec)))
-  (cl-repository-packager/publisher:publish-package
-    reg namespace version result spec)
-  (format t "~%Published cl-protobufs:~a to ~a/~a~%" version registry-url namespace))
-LISP
+if [[ -z "${CL_SOURCE_REGISTRY:-}" ]]; then
+  echo "ERROR: CL_SOURCE_REGISTRY unset. Bootstrap cl-repository-client first (setup-lisp / setup-client)." >&2
+  exit 1
+fi
 
 PKG_VERSION="$VERSION" \
-OCI_REGISTRY="http://${REGISTRY}" \
+OCI_REGISTRY="${REGISTRY}" \
+REGISTRY_URL="http://${REGISTRY}" \
 OCI_NAMESPACE="$NAMESPACE" \
 SOURCE_DIR="${PROJECT_DIR}/" \
 OVERLAY_ROOT="${OVERLAY_ROOT}/" \
-sbcl --noinform --non-interactive --load "${TMPDIR_PULL}/publish.lisp"
+SKIP_CATALOG=false \
+ros -l "${PROJECT_DIR}/scripts/ci/publish-oci.lisp" -q
 
 # ── Verify ────────────────────────────────────────────────────────────
 echo "==> Verifying published artifact"
