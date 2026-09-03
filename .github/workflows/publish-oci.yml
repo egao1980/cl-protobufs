@@ -150,37 +150,12 @@ jobs:
           echo "Platforms:"; cat /tmp/platforms.txt
           find "${OVERLAY_ROOT}" -type f
 
-      - name: Install SBCL
-        run: sudo apt-get update && sudo apt-get install -y sbcl
+      - uses: egao1980/cl-repository/.github/actions/setup-lisp@main
 
-      - name: Install Quicklisp
-        run: |
-          curl -o /tmp/quicklisp.lisp https://beta.quicklisp.org/quicklisp.lisp
-          sbcl --noinform --non-interactive \
-            --load /tmp/quicklisp.lisp \
-            --eval '(quicklisp-quickstart:install :path #p"~/quicklisp/")'
-          sbcl --noinform --non-interactive \
-            --load ~/quicklisp/setup.lisp \
-            --eval '(ql-util:without-prompting (ql:add-to-init-file))'
-
-      # setup-oras@v1 bundles a fixed release manifest: 1.3.1+ is not listed yet; default 1.3.0 linux_arm64
-      # sometimes 404 in act. 1.2.3 is in the manifest with linux_arm64 checksums.
       - name: Install oras
-        uses: oras-project/setup-oras@v1
+        uses: oras-project/setup-oras@v2
         with:
           version: 1.2.3
-
-      - name: Pull cl-repository-packager from GHCR
-        run: |
-          CL_REPO_TAG="0.8.0"
-          CL_REPO_IMAGE="ghcr.io/egao1980/cl-repository/cl-repository-packager"
-          rm -rf /tmp/cl-repo-pull
-          mkdir -p /tmp/cl-repo-pull ~/.local/share/cl-systems
-          rm -rf ~/.local/share/cl-systems/cl-oci-*
-          oras pull "${CL_REPO_IMAGE}:${CL_REPO_TAG}" -o /tmp/cl-repo-pull/
-          for f in /tmp/cl-repo-pull/*.tar.gz; do
-            tar -xzf "$f" -C ~/.local/share/cl-systems/
-          done
 
       - name: Build and publish OCI package
         env:
@@ -198,99 +173,15 @@ jobs:
             REGISTRY_URL="http://${REGISTRY}"
           fi
 
-          cat > /tmp/publish.lisp <<'LISP'
-          (require :asdf)
-          (asdf:initialize-source-registry
-            '(:source-registry
-              (:tree (:home ".local/share/cl-systems/"))
-              :inherit-configuration))
-          (load (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))
-          (ql:quickload :cl-repository-packager)
-
-          (let* ((version (uiop:getenv "PKG_VERSION"))
-                 (registry-url (uiop:getenv "REGISTRY_URL"))
-                 (namespace (uiop:getenv "OCI_NAMESPACE"))
-                 (use-auth (string= "ghcr.io" (uiop:getenv "OCI_REGISTRY")))
-                 (auth (when use-auth
-                         (cl-oci-client/auth:make-auth-config
-                           :username (uiop:getenv "GITHUB_ACTOR")
-                           :password (uiop:getenv "GITHUB_TOKEN"))))
-                 (reg (if use-auth
-                         (cl-oci-client/registry:make-registry registry-url :auth auth)
-                         (cl-oci-client/registry:make-registry registry-url)))
-                 (platform-lines (uiop:read-file-lines "/tmp/platforms.txt"))
-                 (generated-files '(("descriptor.lisp" . "descriptor.lisp")
-                                    ("any.lisp" . "any.lisp")
-                                    ("source_context.lisp" . "source_context.lisp")
-                                    ("type.lisp" . "type.lisp")
-                                    ("api.lisp" . "api.lisp")
-                                    ("duration.lisp" . "duration.lisp")
-                                    ("empty.lisp" . "empty.lisp")
-                                    ("field_mask.lisp" . "field_mask.lisp")
-                                    ("timestamp.lisp" . "timestamp.lisp")
-                                    ("wrappers.lisp" . "wrappers.lisp")
-                                    ("struct.lisp" . "struct.lisp")))
-                 (overlay-root (uiop:ensure-directory-pathname (uiop:getenv "OVERLAY_ROOT")))
-                 (overlays
-                   (loop for line in platform-lines
-                         for slash = (position #\/ line)
-                         when slash
-                         collect
-                         (let* ((os (subseq line 0 slash))
-                                (arch (subseq line (1+ slash)))
-                                (prefix (format nil "~a-~a" os arch))
-                                (lib-dir (merge-pathnames (format nil "lib/~a/" prefix)
-                                                          overlay-root))
-                                ;; protoc + protoc-gen-cl-pb + its bundled shared libs.
-                                ;; NOTE: (directory #p"*") would skip files with
-                                ;; extensions on SBCL; uiop:directory-files gets all.
-                                (native-files
-                                  (loop for p in (uiop:directory-files lib-dir)
-                                        collect (cons (namestring p) (file-namestring p)))))
-                           (unless native-files
-                             (error "No native files found under ~a" lib-dir))
-                           (make-instance 'cl-repository-packager/build-matrix:overlay-spec
-                             :os os :arch arch
-                             :layers
-                             (list
-                               (list :role "native-library"
-                                     :files native-files)
-                               (list :role "generated-source"
-                                     :files (mapcar
-                                              (lambda (pair)
-                                                (cons (namestring
-                                                       (merge-pathnames
-                                                        (format nil "generated/~a/~a" prefix (car pair))
-                                                        overlay-root))
-                                                      (cdr pair)))
-                                              generated-files)))))))
-                 (spec (make-instance 'cl-repository-packager/build-matrix:package-spec
-                         :name "cl-protobufs"
-                         :version version
-                         :source-dir (uiop:getcwd)
-                         :license "MIT"
-                         :description "Protocol Buffers for Common Lisp"
-                         :depends-on '("closer-mop" "alexandria" "trivial-garbage"
-                                       "cl-base64" "local-time" "float-features")
-                         :provides '("cl-protobufs" "cl-protobufs.asdf")
-                         :overlays overlays))
-                 (result (cl-repository-packager/build-matrix:build-package spec)))
-            (format t "~%Overlays: ~{~a~^, ~}~%" platform-lines)
-            ;; :skip-catalog -- the shared <namespace>/catalog GHCR package is
-            ;; writable only by the repo whose workflow created it (grpc); this
-            ;; repo's GITHUB_TOKEN gets 403 there.  Re-enable once this repo is
-            ;; granted write access in the catalog package's Actions settings.
-            (cl-repository-packager/publisher:publish-package
-              reg namespace version result spec :skip-catalog t)
-            (format t "Published cl-protobufs:~a to ~a/~a~%" version registry-url namespace))
-          LISP
-
-          PKG_VERSION="$VERSION" \
-          OCI_REGISTRY="$REGISTRY" \
-          REGISTRY_URL="$REGISTRY_URL" \
-          GITHUB_ACTOR="${{ github.actor }}" \
-          OCI_NAMESPACE="$NAMESPACE" \
-          sbcl --noinform --non-interactive --load /tmp/publish.lisp
+          export PKG_VERSION="$VERSION"
+          export OCI_REGISTRY="$REGISTRY"
+          export REGISTRY_URL="$REGISTRY_URL"
+          export GITHUB_ACTOR="${{ github.actor }}"
+          export OCI_NAMESPACE="$NAMESPACE"
+          export SOURCE_DIR="$GITHUB_WORKSPACE"
+          export PLATFORMS_FILE=/tmp/platforms.txt
+          export SKIP_CATALOG=true
+          ros -l scripts/ci/publish-oci.lisp -q
 
       - name: Verify published artifact
         env:
