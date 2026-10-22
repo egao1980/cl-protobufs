@@ -46,7 +46,7 @@ jobs:
 
       - name: Set up Homebrew (Linux)
         if: matrix.os == 'linux'
-        uses: Homebrew/actions/setup-homebrew@master
+        uses: Homebrew/actions/setup-homebrew@main
 
       - name: Add Homebrew to environment (Linux)
         if: matrix.os == 'linux'
