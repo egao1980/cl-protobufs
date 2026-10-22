@@ -945,7 +945,7 @@
       (loop repeat 8 doing
         (let ((byte (ldb (byte 8 0) bits)))
           (declare (type (unsigned-byte 8) byte))
-          (setf byte (ash bits -8))
+          (setq bits (ash bits -8))
           (fast-octet-out buffer byte)))
       8)))
 
@@ -1061,12 +1061,12 @@
   #-sbcl
   ;; Eight bits at a time, least significant bits first
   (let ((val  0))
-    (declare (type (unsigned-byte 64) val)
+    (declare (type (unsigned-byte 64) val))
     (loop repeat 8
           for places fixnum upfrom 0 by 8
           for byte fixnum = (prog1 (aref buffer index) (iincf index))
           do (setq val (logior val (ash byte places))))
-    (values (float-features:bits-double-float val) index))))
+    (values (float-features:bits-double-float val) index)))
 
 (defun decode-string (buffer index)
   "Decodes the next UTF-8 encoded string in the buffer at the given index.
