@@ -1,7 +1,9 @@
 ;;;; Keep in sync with cl-repository/scripts/ci/ensure-packager.lisp until
 ;;;; generated-source overlays land on publish-native-package.yml.
-;;;; Requires setup-lisp (cl-repository-client on CL_SOURCE_REGISTRY).
-;;;; Do not colon-qualify packager/oci-client symbols here.
+;;;; Load packager + oci-client the same way canned `ci` phase:publish does.
+;;;; Requires setup-lisp (client tree in CL_REPOSITORY_DEST; see %client-registry).
+;;;; Do not colon-qualify packager/oci-client symbols here — this file is
+;;;; LOADed before those systems exist.
 
 (require :asdf)
 
@@ -25,7 +27,26 @@
   #-sbcl
   (funcall fn))
 
-(%ci-muffle (lambda () (asdf:load-system "cl-repository-client")))
+(defun %client-registry ()
+  "setup-lisp no longer exports CL_SOURCE_REGISTRY (5c8af8c); the client tree is
+   CL_REPOSITORY_DEST. Register it (and the checkout) the same way the canned ci
+   action's %load-client does, inheriting whatever else the job configured."
+  (let ((dest (uiop:getenv "CL_REPOSITORY_DEST")))
+    (when (and dest (plusp (length dest)))
+      (asdf:initialize-source-registry
+       `(:source-registry
+         (:tree ,(uiop:ensure-directory-pathname dest))
+         (:tree ,(uiop:getcwd))
+         :inherit-configuration)))))
+
+(%client-registry)
+(%ci-muffle (lambda ()
+              (asdf:load-system "cl-repository-client")
+              ;; Choose the HTTP backend while only the client tree is on
+              ;; the registry, outside ASDF's load of the client.
+              (let ((ensure (and (find-package "CL-OCI-CLIENT/HTTP")
+                                 (find-symbol "ENSURE-HTTP-BACKEND" "CL-OCI-CLIENT/HTTP"))))
+                (when (and ensure (fboundp ensure)) (funcall ensure)))))
 
 (defun %env (name &optional default)
   (let ((v (uiop:getenv name)))
@@ -44,7 +65,6 @@
            (cl-repo:ensure-systems "cl-repository-packager" :default-source :oci))
        (cl-repo:ensure-systems "cl-oci-client" :default-source :oci))))
   (cl-repository-client/asdf-integration:configure-asdf-source-registry)
-  (cl-repository-client/asdf-integration:load-system-init-files)
   (%ci-muffle
    (lambda ()
      (asdf:load-system "cl-repository-packager")
