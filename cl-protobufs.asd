@@ -10,7 +10,7 @@
 (defsystem :cl-protobufs
   :name "CL Protobufs"
   :author "Scott McKay"
-  :version "2.0.1"
+  :version "2.0.2"
   :licence "MIT-style"
   :maintainer ("Jon Godbout" "Carl Gay" "Ben Kuehnert")
   :description      "Protobufs for Common Lisp"
@@ -193,7 +193,7 @@ and functionality for working with them."
 (defsystem :cl-protobufs/tests
   :name "Protobufs Tests"
   :author "Scott McKay"
-  :version "2.0.1"
+  :version "2.0.2"
   :licence "MIT-style"
   :maintainer ("Jon Godbout" "Carl Gay" "Ben Kuehnert")
   :description      "Test code for Protobufs for Common Lisp"
